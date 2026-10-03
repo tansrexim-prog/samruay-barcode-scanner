@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>สแกนบาร์โค้ดสินค้า</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{margin:0;width:100%;height:100%;font-family:Arial,"Noto Sans Thai",sans-serif;background:#050b14;color:#fff}
+    body{display:flex;flex-direction:column;overflow:hidden}
+    .head{
+      display:flex;align-items:center;justify-content:space-between;gap:12px;
+      padding:calc(12px + env(safe-area-inset-top)) 14px 12px;
+      background:#0d1b2b;border-bottom:1px solid rgba(255,255,255,.12)
+    }
+    .head b{font-size:18px}
+    .sub{font-size:12px;color:#c8d3df;margin-top:3px}
+    .close{
+      border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);
+      color:#fff;border-radius:8px;padding:9px 12px;font-weight:700
+    }
+    .stage{position:relative;flex:1;min-height:0;background:#000;overflow:hidden}
+    video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+    .frame{
+      position:absolute;left:7%;right:7%;top:27%;height:34%;
+      border:3px solid #fff;border-radius:16px;
+      box-shadow:0 0 0 9999px rgba(0,0,0,.32);
+      pointer-events:none
+    }
+    .frame:before{
+      content:"";position:absolute;left:8%;right:8%;top:50%;height:2px;
+      background:rgba(255,255,255,.85);box-shadow:0 0 10px rgba(255,255,255,.45)
+    }
+    .status-wrap{
+      position:absolute;left:14px;right:14px;bottom:calc(18px + env(safe-area-inset-bottom));
+      text-align:center;pointer-events:none
+    }
+    .status{
+      display:inline-block;max-width:92vw;padding:10px 13px;border-radius:10px;
+      background:rgba(13,27,43,.86);border:1px solid rgba(255,255,255,.20);
+      line-height:1.45;font-size:14px
+    }
+    .status.ok{background:rgba(2,122,72,.90)}
+    .status.bad{background:rgba(180,35,24,.92)}
+    .manual{
+      position:absolute;top:12px;left:12px;right:12px;display:none;
+      padding:12px;background:rgba(13,27,43,.92);border-radius:10px
+    }
+    .manual.show{display:block}
+    .manual input{width:100%;padding:10px;border-radius:7px;border:1px solid #ccd5df;font-size:16px}
+    .manual button{margin-top:8px;width:100%;padding:10px;border:0;border-radius:7px;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="head">
+    <div>
+      <b>📷 สแกนบาร์โค้ดสินค้า</b>
+      <div class="sub">หน้านี้เปิดนอก Google Apps Script เพื่อให้เบราว์เซอร์ขอสิทธิ์กล้องได้</div>
+    </div>
+    <button class="close" type="button" onclick="cancelScan()">ยกเลิก</button>
+  </div>
+
+  <div class="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="frame"></div>
+
+    <div class="manual" id="manual">
+      <div style="margin-bottom:7px;font-weight:700">กรอกรหัสสินค้าแทน</div>
+      <input id="manualCode" autocomplete="off" placeholder="Item Code">
+      <button type="button" onclick="returnCode(document.getElementById('manualCode').value)">กลับพร้อมรหัสนี้</button>
+    </div>
+
+    <div class="status-wrap">
+      <div class="status" id="status">กำลังเริ่มต้นกล้อง...</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const $=id=>document.getElementById(id);
+  let stream=null;
+  let running=false;
+  let detector=null;
+  let raf=0;
+  let zxingControls=null;
+  let accepted=false;
+
+  const params=new URLSearchParams(location.search);
+  const returnUrl=params.get('return')||'';
+
+  function setStatus(text,type){
+    const el=$('status');
+    el.textContent=text||'';
+    el.className='status'+(type?' '+type:'');
+  }
+
+  function showManual(){
+    $('manual').classList.add('show');
+  }
+
+  function safeReturnUrl(){
+    if(!returnUrl)return null;
+    try{
+      const u=new URL(returnUrl);
+      if(u.protocol!=='https:')return null;
+      return u;
+    }catch(e){return null}
+  }
+
+  window.returnCode=function(value){
+    const code=String(value||'').trim();
+    if(!code)return;
+    const u=safeReturnUrl();
+    if(!u){
+      setStatus('Return URL ไม่ถูกต้อง','bad');
+      return;
+    }
+    accepted=true;
+    stopCamera();
+    u.searchParams.set('item',code);
+    location.href=u.toString();
+  };
+
+  window.cancelScan=function(){
+    accepted=true;
+    stopCamera();
+    const u=safeReturnUrl();
+    if(u)location.href=u.toString();
+    else history.back();
+  };
+
+  function stopCamera(){
+    running=false;
+    if(raf)cancelAnimationFrame(raf);
+    raf=0;
+    if(zxingControls){
+      try{zxingControls.stop()}catch(e){}
+      zxingControls=null;
+    }
+    if(stream){
+      try{stream.getTracks().forEach(t=>t.stop())}catch(e){}
+      stream=null;
+    }
+    const v=$('video');
+    try{v.pause()}catch(e){}
+    v.srcObject=null;
+  }
+
+  async function nativeLoop(){
+    if(!running||!detector)return;
+    const video=$('video');
+
+    if(video.readyState>=2){
+      try{
+        const results=await detector.detect(video);
+        if(results&&results.length){
+          const result=results.find(x=>x&&x.rawValue)||results[0];
+          if(result&&result.rawValue){
+            setStatus('อ่านได้: '+result.rawValue,'ok');
+            returnCode(result.rawValue);
+            return;
+          }
+        }
+      }catch(e){}
+    }
+
+    if(running)raf=requestAnimationFrame(nativeLoop);
+  }
+
+  async function tryNativeDetector(){
+    if(!('BarcodeDetector' in window))return false;
+    try{
+      let supported=[];
+      if(typeof BarcodeDetector.getSupportedFormats==='function'){
+        supported=await BarcodeDetector.getSupportedFormats();
+      }
+      const wanted=[
+        'code_128','code_39','code_93',
+        'ean_13','ean_8','upc_a','upc_e',
+        'qr_code','data_matrix','itf','codabar'
+      ];
+      const formats=supported.length?wanted.filter(x=>supported.includes(x)):wanted;
+      detector=new BarcodeDetector(formats.length?{formats}:undefined);
+      setStatus('พร้อมสแกน · วางบาร์โค้ดให้อยู่ในกรอบ');
+      raf=requestAnimationFrame(nativeLoop);
+      return true;
+    }catch(e){
+      detector=null;
+      return false;
+    }
+  }
+
+  function loadZXing(){
+    if(window.ZXingBrowser)return Promise.resolve(true);
+    return new Promise(resolve=>{
+      const s=document.createElement('script');
+      s.src='https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js';
+      s.async=true;
+      s.onload=()=>resolve(!!window.ZXingBrowser);
+      s.onerror=()=>resolve(false);
+      document.head.appendChild(s);
+    });
+  }
+
+  async function tryZXing(){
+    setStatus('กำลังเตรียมตัวอ่านบาร์โค้ด...');
+    const ok=await loadZXing();
+    if(!ok)return false;
+    try{
+      const reader=new ZXingBrowser.BrowserMultiFormatReader();
+      zxingControls=await reader.decodeFromVideoElement($('video'),(result,error)=>{
+        if(result&&!accepted){
+          const value=typeof result.getText==='function'
+            ? result.getText()
+            : String(result.text||'');
+          if(value){
+            setStatus('อ่านได้: '+value,'ok');
+            returnCode(value);
+          }
+        }
+      });
+      setStatus('พร้อมสแกน · วางบาร์โค้ดให้อยู่ในกรอบ');
+      return true;
+    }catch(e){
+      return false;
+    }
+  }
+
+  async function start(){
+    const u=safeReturnUrl();
+    if(!u){
+      setStatus('ไม่พบ Return URL จากระบบคลังสินค้า','bad');
+      showManual();
+      return;
+    }
+
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+      setStatus('เบราว์เซอร์นี้ไม่รองรับ Camera API','bad');
+      showManual();
+      return;
+    }
+
+    try{
+      setStatus('กำลังขอสิทธิ์ใช้กล้อง...');
+      stream=await navigator.mediaDevices.getUserMedia({
+        video:{
+          facingMode:{ideal:'environment'},
+          width:{ideal:1920},
+          height:{ideal:1080}
+        },
+        audio:false
+      });
+
+      const video=$('video');
+      video.srcObject=stream;
+      await video.play();
+      running=true;
+
+      if(await tryNativeDetector())return;
+      if(await tryZXing())return;
+
+      setStatus('เปิดกล้องได้ แต่ตัวอ่านบาร์โค้ดไม่พร้อมใช้งาน','bad');
+      showManual();
+
+    }catch(e){
+      const name=String(e&&e.name||'');
+      if(name==='NotAllowedError'||name==='PermissionDeniedError'){
+        setStatus('ไม่ได้รับสิทธิ์ใช้กล้อง · กรุณาอนุญาต Camera แล้วลองใหม่','bad');
+      }else if(name==='NotFoundError'){
+        setStatus('ไม่พบกล้องบนอุปกรณ์นี้','bad');
+      }else{
+        setStatus('เปิดกล้องไม่สำเร็จ: '+(e&&e.message?e.message:String(e)),'bad');
+      }
+      showManual();
+    }
+  }
+
+  window.addEventListener('pagehide',stopCamera,{once:true});
+  start();
+})();
+</script>
+</body>
+</html>
